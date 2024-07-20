@@ -9,7 +9,7 @@ from typing import SupportsFloat
 import cereal.messaging as messaging
 
 from cereal import car, log, custom
-from cereal.visionipc import VisionIpcClient, VisionStreamType
+from msgq.visionipc import VisionIpcClient, VisionStreamType
 
 
 from openpilot.common.conversions import Conversions as CV
@@ -18,10 +18,9 @@ from openpilot.common.numpy_fast import clip
 from openpilot.common.params import Params
 from openpilot.common.realtime import config_realtime_process, Priority, Ratekeeper, DT_CTRL
 from openpilot.common.swaglog import cloudlog
+from openpilot.selfdrive.car.car_helpers import get_car_interface, get_startup_event
 
-from openpilot.selfdrive.athena.registration import is_registered_device
-from openpilot.selfdrive.car.car_helpers import get_startup_event
-from openpilot.selfdrive.car.card import CarD
+from openpilot.selfdrive.car.card import Car
 from openpilot.selfdrive.controls.lib.alertmanager import AlertManager, set_offroad_alert
 from openpilot.selfdrive.controls.lib.drive_helpers import VCruiseHelper, clip_curvature, get_lag_adjusted_curvature
 from openpilot.selfdrive.controls.lib.events import Events, ET
@@ -68,16 +67,17 @@ PERSONALITY_MAPPING = {0: 0, 1: 1, 2: 2, 3: 2}
 
 class Controls:
   def __init__(self, CI=None):
-    self.card = CarD(CI)
-
     self.params = Params()
 
-    with car.CarParams.from_bytes(self.params.get("CarParams", block=True)) as msg:
-      # TODO: this shouldn't need to be a builder
-      self.CP = msg.as_builder()
+    if CI is None:
+      cloudlog.info("controlsd is waiting for CarParams")
+      self.CP = messaging.log_from_bytes(self.params.get("CarParams", block=True), car.CarParams)
+      cloudlog.info("controlsd got CarParams")
 
-    self.CI = self.card.CI
-
+      # Uses car interface helper functions, altering state won't be considered by card for actuation
+      self.CI = get_car_interface(self.CP)
+    else:
+      self.CI, self.CP = CI, CI.CP
 
     # Ensure the current branch is cached, otherwise the first iteration of controlsd lags
     self.branch = get_short_branch()
@@ -203,7 +203,7 @@ class Controls:
 
   def set_initial_state(self):
     if REPLAY:
-      controls_state = Params().get("ReplayControlsState")
+       controls_state = self.params.get("ReplayControlsState")
       if controls_state is not None:
         with log.ControlsState.from_bytes(controls_state) as controls_state:
           self.v_cruise_helper.v_cruise_kph = controls_state.vCruise
@@ -260,7 +260,7 @@ class Controls:
 
     if CS.gasPressed and CS.cruiseState.enabled:
       self.events.add(EventName.gasPressedOverride)
-
+ 
     if not self.CP.notCar:
       if not self.d_camera_hardware_missing:
         self.events.add_from_msg(self.sm['driverMonitoringState'].events)
@@ -365,7 +365,7 @@ class Controls:
       self.process_not_running = False
     if not REPLAY and self.rk.lagging:
       self.events.add(EventName.controlsdLagging)
-    if len(self.sm['radarState'].radarErrors) or (not self.rk.lagging and not self.sm.all_checks(['radarState'])):
+    if len(self.sm['radarState'].radarErrors) or ((not self.rk.lagging or REPLAY) and not self.sm.all_checks(['radarState'])):
       self.events.add(EventName.radarFault)
     if not self.sm.valid['pandaStates']:
       self.events.add(EventName.usbError)
