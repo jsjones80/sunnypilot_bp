@@ -3,7 +3,7 @@ from opendbc.can.can_define import CANDefine
 from opendbc.can.parser import CANParser
 from openpilot.common.conversions import Conversions as CV
 from openpilot.selfdrive.car.ford.fordcan import CanBus
-from openpilot.selfdrive.car.ford.values import DBC, CarControllerParams, FordFlags, BUTTONS
+from openpilot.selfdrive.car.ford.values import DBC, CarControllerParams, FordFlags, BUTTON_STATES
 from openpilot.selfdrive.car.interfaces import CarStateBase
 
 GearShifter = car.CarState.GearShifter
@@ -14,29 +14,39 @@ class CarState(CarStateBase):
   def __init__(self, CP):
     super().__init__(CP)
     can_define = CANDefine(DBC[CP.carFingerprint]["pt"])
+
     if CP.transmissionType == TransmissionType.automatic:
-      self.shifter_values = can_define.dv["PowertrainData_10"]["TrnRng_D_Rq"]
+      self.shifter_values = can_define.dv["Gear_Shift_by_Wire_FD1"]["TrnRng_D_RqGsm"]
 
     self.vehicle_sensors_valid = False
+    self.steering_angle_offset_deg = 0
 
     self.prev_distance_button = 0
     self.distance_button = 0
 
     self.lkas_enabled = None
     self.prev_lkas_enabled = None
+    self.buttonStates = BUTTON_STATES.copy()
+    self.buttonStatesPrev = BUTTON_STATES.copy()
     self.v_limit = 0
-
-    self.button_states = {button.event_type: False for button in BUTTONS}
 
   def update(self, cp, cp_cam):
     ret = car.CarState.new_message()
 
     self.prev_mads_enabled = self.mads_enabled
     self.prev_lkas_enabled = self.lkas_enabled
+    self.buttonStatesPrev = self.buttonStates.copy()
 
-    # Occasionally on startup, the ABS module recalibrates the steering pinion offset, so we need to block engagement
-    # The vehicle usually recovers out of this state within a minute of normal driving
-    self.vehicle_sensors_valid = cp.vl["SteeringPinion_Data"]["StePinCompAnEst_D_Qf"] == 3
+    if self.CP.flags & FordFlags.ALT_STEER_ANGLE:
+      self.vehicle_sensors_valid = (
+        int((cp.vl["ParkAid_Data"]["ExtSteeringAngleReq2"] + 1000) * 10) not in (32766, 32767)
+        and cp.vl["ParkAid_Data"]["EPASExtAngleStatReq"] == 0
+        and cp.vl["ParkAid_Data"]["ApaSys_D_Stat"] in (0, 1)
+      )
+    else:
+      # Occasionally on startup, the ABS module recalibrates the steering pinion offset, so we need to block engagement
+      # The vehicle usually recovers out of this state within a minute of normal driving
+      self.vehicle_sensors_valid = cp.vl["SteeringPinion_Data"]["StePinCompAnEst_D_Qf"] == 3
 
     # car speed
     ret.vEgoRaw = cp.vl["BrakeSysFeatures"]["Veh_V_ActlBrk"] * CV.KPH_TO_MS
@@ -54,7 +64,14 @@ class CarState(CarStateBase):
     ret.parkingBrake = cp.vl["DesiredTorqBrk"]["PrkBrkStatus"] in (1, 2)
 
     # steering wheel
-    ret.steeringAngleDeg = cp.vl["SteeringPinion_Data"]["StePinComp_An_Est"]
+    if self.CP.flags & FordFlags.ALT_STEER_ANGLE:
+      steering_angle_init = cp.vl["SteeringPinion_Data_Alt"]["StePinRelInit_An_Sns"]
+      if self.vehicle_sensors_valid:
+        steering_angle_est = cp.vl["ParkAid_Data"]["ExtSteeringAngleReq2"]
+        self.steering_angle_offset_deg = steering_angle_est - steering_angle_init
+      ret.steeringAngleDeg = steering_angle_init + self.steering_angle_offset_deg
+    else:
+      ret.steeringAngleDeg = cp.vl["SteeringPinion_Data"]["StePinComp_An_Est"]
     ret.steeringTorque = cp.vl["EPAS_INFO"]["SteeringColumnTorque"]
     ret.steeringPressed = self.update_steering_pressed(abs(ret.steeringTorque) > CarControllerParams.STEER_DRIVER_ALLOWANCE, 5)
     ret.steerFaultTemporary = cp.vl["EPAS_INFO"]["EPAS_Failure"] == 1
@@ -82,7 +99,7 @@ class CarState(CarStateBase):
 
     # gear
     if self.CP.transmissionType == TransmissionType.automatic:
-      gear = self.shifter_values.get(cp.vl["PowertrainData_10"]["TrnRng_D_Rq"])
+      gear = self.shifter_values.get(cp.vl["Gear_Shift_by_Wire_FD1"]["TrnRng_D_RqGsm"])
       ret.gearShifter = self.parse_gear_shifter(gear)
     elif self.CP.transmissionType == TransmissionType.manual:
       ret.clutchPressed = cp.vl["Engine_Clutch_Data"]["CluPdlPos_Pc_Meas"] > 0
@@ -90,18 +107,6 @@ class CarState(CarStateBase):
         ret.gearShifter = GearShifter.reverse
       else:
         ret.gearShifter = GearShifter.drive
-
-    # Buttons
-    button_events = []
-    for button in BUTTONS:
-      state = (cp.vl[button.can_addr][button.can_msg] in button.values)
-      if self.button_states[button.event_type] != state:
-        event = car.CarState.ButtonEvent.new_message()
-        event.type = button.event_type
-        event.pressed = state
-        button_events.append(event)
-      self.button_states[button.event_type] = state
-    self.button_events = button_events
 
     # safety
     ret.stockFcw = bool(cp_cam.vl["ACCDATA_3"]["FcwVisblWarn_B_Rq"])
@@ -127,6 +132,13 @@ class CarState(CarStateBase):
       ret.rightBlindspot = cp_bsm.vl["Side_Detect_R_Stat"]["SodDetctRight_D_Stat"] != 0
 
     self.lkas_enabled = bool(cp.vl["Steering_Data_FD1"]["TjaButtnOnOffPress"])
+
+    self.buttonStates["accelCruise"] = bool(cp.vl["Steering_Data_FD1"]["CcAslButtnSetIncPress"])
+    self.buttonStates["decelCruise"] = bool(cp.vl["Steering_Data_FD1"]["CcAslButtnSetDecPress"])
+    self.buttonStates["cancel"] = bool(cp.vl["Steering_Data_FD1"]["CcAslButtnCnclPress"])
+    self.buttonStates["setCruise"] = bool(cp.vl["Steering_Data_FD1"]["CcAslButtnSetPress"])
+    self.buttonStates["resumeCruise"] = bool(cp.vl["Steering_Data_FD1"]["CcAsllButtnResPress"])
+    self.buttonStates["gapAdjustCruise"] = bool(cp.vl["Steering_Data_FD1"]["AccButtnGapTogglePress"])
 
     # Stock steering buttons so that we can passthru blinkers etc.
     self.buttons_stock_values = cp.vl["Steering_Data_FD1"]
@@ -158,13 +170,21 @@ class CarState(CarStateBase):
       ("BrakeSnData_4", 50),
       ("EngBrakeData", 10),
       ("Cluster_Info1_FD1", 10),
-      ("SteeringPinion_Data", 100),
       ("EPAS_INFO", 50),
       ("Steering_Data_FD1", 10),
       ("BodyInfo_3_FD1", 2),
       ("RCMStatusMessage2_FD1", 10),
     ]
 
+    if CP.flags & FordFlags.ALT_STEER_ANGLE:
+      messages += [
+        ("SteeringPinion_Data_Alt", 100),
+        ("ParkAid_Data", 50),
+      ]
+    else:
+      messages += [
+        ("SteeringPinion_Data", 100),
+      ]
     if CP.flags & FordFlags.CANFD:
       messages += [
         ("Lane_Assist_Data3_FD1", 33),
@@ -176,7 +196,7 @@ class CarState(CarStateBase):
 
     if CP.transmissionType == TransmissionType.automatic:
       messages += [
-        ("PowertrainData_10", 10),
+        ("Gear_Shift_by_Wire_FD1", 10),
       ]
     elif CP.transmissionType == TransmissionType.manual:
       messages += [
